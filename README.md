@@ -243,6 +243,23 @@ HUC = '0108'          # -> any even-length HUC, 2 to 12 digits
 Everything downstream — grid, terrain, network, soils, vegetation,
 forcing, states, config — follows from that one line.
 
+**Or bring your own DEM.** A DEM you already have (clipped, reprojected,
+lidar, a colleague's grid) can define the model grid instead of a fetched
+one:
+
+```python
+import ww_dhsvm.terrain as T
+grid, dem = T.demFromRaster('camp_branch_28m.tif')    # grid + mask from the raster
+terrain = T.conditionDEM(dem.astype('float32'), grid)
+```
+
+The raster's extent, cell size and CRS become the grid; if it is clipped
+to the basin, its no-data cells become the mask. To keep real elevations
+outside the mask (the rectangle-plus-mask convention `conditionDEM`
+expects), read the clipped raster for the grid and the unclipped tile it
+was cut from for the elevations: `T.demFromRaster(tile, grid=grid,
+mask_from_nodata=False)`.
+
 ---
 
 ## The worked example: the Connecticut River Basin
@@ -304,7 +321,24 @@ km², the other 21 drain 31.5 km² between them, or 0.11% of the basin.
 They are slivers along the divide where a flow path leaves the mask
 directly instead of joining the main network. On a headwater catchment,
 though, 22 outlets would mean the delineation is broken — which is why
-the warning stays.
+the warning stays. `checkOutlets` (also run by `checkTopology` when given
+the network, terrain and grid) checks what the format checks cannot: the
+cell with the largest upstream area and the lowest channel cell both lie
+in outlet segments, and every outlet is flagged `SAVE`. A network whose
+segments point uphill passes every format check and fails this one.
+
+**The channel-initiation area can come from the terrain instead of a
+habit.** `extractNetwork(..., channel_threshold_km2='drop')` runs the
+constant stream drop analysis (Broscoe 1959; Tarboton, Bras and
+Rodriguez-Iturbe 1991, as in TauDEM): support areas are swept, streams
+are ordered, and the mean drop of first-order streams is tested against
+the higher orders; the objective area is the start of the first
+sustained band of thresholds where the difference is not significant
+(`ww_dhsvm.channel_initiation`, ported from the DHSVM_Stream_Toolkit).
+On a 3.4 km² headwater at 28 m the criterion says where the law is
+violated more firmly than where it holds, because the higher-order sample
+shrinks to a handful of streams; on a basin this size it is a check on a
+chosen area rather than a substitute for choosing one.
 
 ### Soils and vegetation
 
@@ -596,8 +630,18 @@ them with the three `fetch_*.py` scripts above; nothing else is needed.
 
 ```bash
 python -m pytest tests/test_formats.py -v      # 36 conventions DHSVM does not check
+python -m pytest tests/test_channel_initiation.py tests/test_outlet_invariants.py -v
 python tests/test_end_to_end_synthetic.py      # builds a synthetic basin and RUNS DHSVM
 ```
+
+`test_channel_initiation.py` and `test_outlet_invariants.py` cover the
+drop analysis, the bring-your-own-DEM entry and the outlet invariants on
+a synthetic basin and on Camp Branch (`tests/data/camp_branch_28m_dem.tif`,
+a 74 x 82 headwater at 28 m): 266 channel cells and 30 segments at a
+support area of 47571.5 m², one outlet at the basin's lowest and
+largest-area cell, and a constant-drop objective of 120 cells.
+`tests/conftest.py` puts the checkout on `sys.path`, so they run from any
+clone location.
 
 `test_formats.py` checks binary dtypes, state-matrix stacking, grid
 origin, zero-based stream indices, metres-per-timestep precipitation, the

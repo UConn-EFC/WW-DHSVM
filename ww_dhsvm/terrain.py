@@ -49,6 +49,120 @@ import ww_dhsvm.warp
 from ww_dhsvm.grid import ModelGrid
 
 
+def gridFromRaster(path: str) -> ModelGrid:
+    """Build a :class:`ModelGrid` from an existing north-up raster.
+
+    Bring-your-own-DEM entry: the raster's extent, cell size and CRS
+    become the model grid, so a DEM prepared elsewhere (a clipped and
+    reprojected tile, a lidar product, a colleague's grid) is used as is
+    instead of being fetched and resampled.  The raster must be square-
+    celled, north-up and in a projected CRS.
+
+    Parameters
+    ----------
+    path : str
+        A raster readable by rasterio.
+
+    Returns
+    -------
+    ModelGrid
+        With no mask; see :func:`demFromRaster` for the mask.
+    """
+    import rasterio
+
+    with rasterio.open(path) as src:
+        tr = src.transform
+        if abs(tr.b) > 0 or abs(tr.d) > 0 or tr.e >= 0:
+            raise ValueError(f'{path}: the raster must be north-up (no rotation)')
+        if abs(abs(tr.a) - abs(tr.e)) > 1e-6 * abs(tr.a):
+            raise ValueError(f'{path}: cells must be square, got {tr.a} x {tr.e}')
+        if src.crs is None:
+            raise ValueError(f'{path}: the raster has no CRS')
+        crs = ww_dhsvm.crs.from_rasterio(src.crs)
+        if not crs.is_projected:
+            raise ValueError(f'{path}: the raster CRS must be projected (metres)')
+        grid = ModelGrid(src.height, src.width, abs(tr.a),
+                         src.bounds.left, src.bounds.bottom, crs)
+    logging.info(f'  model grid from {path}: {grid.nrows} rows x {grid.ncols} cols '
+                 f'@ {grid.cellsize:g} m')
+    return grid
+
+
+def demFromRaster(path: str,
+                  grid: Optional[ModelGrid] = None,
+                  mask_from_nodata: bool = True,
+                  fill: bool = True) -> Tuple[ModelGrid, np.ndarray]:
+    """Read a DEM from an existing raster onto the model grid.
+
+    Two ways to use it.  Without ``grid``, the raster defines the grid
+    (see :func:`gridFromRaster`) and, if it is clipped to the basin, its
+    no-data cells define the basin mask.  With ``grid``, the raster is
+    read through the window that covers the grid, which must lie on the
+    raster's cell edges; this is how a basin-clipped DEM (grid and mask)
+    and the unclipped tile it was cut from (real elevations outside the
+    mask, which the rectangle-plus-mask convention of
+    :func:`conditionDEM` expects) are combined.
+
+    Parameters
+    ----------
+    path : str
+        A raster readable by rasterio, in the grid's CRS.
+    grid : ModelGrid, optional
+        The target grid.  When ``None`` it is built from the raster.
+    mask_from_nodata : bool, optional
+        When the grid has no mask yet, take the raster's valid cells as
+        the basin mask.  Default ``True``.
+    fill : bool, optional
+        Fill no-data cells by nearest-neighbour dilation
+        (:func:`fillGaps`) so the array is NaN-free, as
+        :func:`conditionDEM` requires.  Default ``True``.
+
+    Returns
+    -------
+    (ModelGrid, np.ndarray)
+        The grid (with its mask set when requested) and the float64 DEM.
+    """
+    import rasterio
+    import rasterio.windows
+
+    if grid is None:
+        grid = gridFromRaster(path)
+    with rasterio.open(path) as src:
+        src_crs = ww_dhsvm.crs.from_rasterio(src.crs)
+        if not ww_dhsvm.crs.isEqual(src_crs, grid.crs):
+            raise ValueError(f'{path}: CRS {ww_dhsvm.crs.toString(src_crs)} differs '
+                             f'from the grid CRS {ww_dhsvm.crs.toString(grid.crs)}')
+        if abs(abs(src.transform.a) - grid.cellsize) > 1e-6 * grid.cellsize:
+            raise ValueError(f'{path}: cell size {abs(src.transform.a)} differs from '
+                             f'the grid cell size {grid.cellsize}')
+        win = rasterio.windows.from_bounds(*grid.bounds, transform=src.transform)
+        col0, row0 = win.col_off, win.row_off
+        if (abs(col0 - round(col0)) > 1e-3 or abs(row0 - round(row0)) > 1e-3
+                or abs(win.width - grid.ncols) > 1e-3
+                or abs(win.height - grid.nrows) > 1e-3):
+            raise ValueError(f'{path}: the grid does not lie on this raster\'s cell '
+                             f'edges (window offset {col0:.3f}, {row0:.3f}; size '
+                             f'{win.width:.3f} x {win.height:.3f})')
+        win = rasterio.windows.Window(int(round(col0)), int(round(row0)),
+                                      grid.ncols, grid.nrows)
+        arr = src.read(1, window=win, boundless=True,
+                       fill_value=src.nodata if src.nodata is not None else np.nan)
+        arr = arr.astype('float64')
+        if src.nodata is not None and np.isfinite(src.nodata):
+            arr[arr == src.nodata] = np.nan
+    valid = np.isfinite(arr)
+    if mask_from_nodata and grid.mask is None:
+        grid.mask = valid.astype('uint8')
+        n = int(grid.mask.sum())
+        logging.info(f'  basin mask from the raster\'s valid cells: {n} of '
+                     f'{grid.nrows * grid.ncols} ({n * grid.cell_area / 1e6:.2f} km^2)')
+    if fill and not valid.all():
+        arr = fillGaps(arr)
+    logging.info(f'  DEM from {path}: {np.nanmin(arr):.1f} to {np.nanmax(arr):.1f} m, '
+                 f'{int(valid.sum())} valid cells')
+    return grid, arr
+
+
 def resampleToGrid(dataset,
                    grid: ModelGrid,
                    resampling: str = 'bilinear',

@@ -245,10 +245,11 @@ def classifyChannels(slope: np.ndarray,
 
 def extractNetwork(terrain: Dict[str, Any],
                    grid: ModelGrid,
-                   channel_threshold_km2: float = 1.0,
+                   channel_threshold_km2: float | str = 1.0,
                    min_segment_cells: int = 2,
                    min_slope: float = 1.0e-4,
                    gauge_rowcol: Optional[Tuple[int, int]] = None,
+                   drop_kwargs: Optional[Dict[str, Any]] = None,
                    **hg_kwargs) -> Dict[str, Any]:
     """Delineate a channel network and build all DHSVM stream tables.
 
@@ -257,7 +258,12 @@ def extractNetwork(terrain: Dict[str, Any],
     is the standard approach and is what the DHSVM AML toolchain used; it
     is a genuine modelling choice, since it sets how much of the basin is
     treated as hillslope versus channel, and it should be checked against
-    mapped drainage density (see :func:`compareToReference`).
+    mapped drainage density (see :func:`compareToReference`).  Pass
+    ``channel_threshold_km2='drop'`` to let the constant stream drop
+    analysis choose the area from the terrain
+    (:func:`ww_dhsvm.channel_initiation.dropAnalysis`; ``drop_kwargs``
+    are passed on to it, and the sweep is returned under
+    ``'drop_analysis'``).
 
     Parameters
     ----------
@@ -296,6 +302,20 @@ def extractNetwork(terrain: Dict[str, Any],
     uparea = terrain['uparea']
     dem = terrain['dem']
     mask = grid.mask if grid.mask is not None else np.ones(grid.shape, dtype='uint8')
+
+    drop = None
+    if isinstance(channel_threshold_km2, str):
+        if channel_threshold_km2.lower() != 'drop':
+            raise ValueError("channel_threshold_km2 must be a number in km^2 or 'drop'")
+        from ww_dhsvm.channel_initiation import dropAnalysis
+        drop = dropAnalysis(terrain, grid, **(drop_kwargs or {}))
+        if drop['objective_km2'] is None:
+            raise ValueError('the drop analysis found no sustained band of passing '
+                             'thresholds; widen its range with drop_kwargs or give '
+                             'channel_threshold_km2 explicitly')
+        channel_threshold_km2 = float(drop['objective_km2'])
+        logging.info(f'  channel threshold from the drop analysis: '
+                     f'{channel_threshold_km2:.5f} km^2 ({drop["objective_cells"]} cells)')
 
     thresh_m2 = channel_threshold_km2 * 1e6
     stream_mask = (uparea >= thresh_m2) & (mask != 0)
@@ -359,7 +379,8 @@ def extractNetwork(terrain: Dict[str, Any],
                 channel_mask=stream_mask, segment_id_grid=seg_id_grid,
                 cut_height_grid=cut_h, cut_width_grid=cut_w,
                 drainage_density=drainage_density,
-                channel_threshold_km2=channel_threshold_km2)
+                channel_threshold_km2=channel_threshold_km2,
+                drop_analysis=drop)
 
 
 def _buildSegments(flw, stream_mask, uparea, dem, grid, min_segment_cells):
@@ -812,7 +833,113 @@ def _capChannelAreaToCell(stream_map: pd.DataFrame, grid: ModelGrid,
 # Topology validation
 # ---------------------------------------------------------------------------
 
-def checkTopology(segments: pd.DataFrame) -> Dict[str, Any]:
+def checkOutlets(network: Dict[str, Any],
+                 terrain: Dict[str, Any],
+                 grid: ModelGrid) -> Dict[str, Any]:
+    """Check that the network drains to the basin mouth.
+
+    Three invariants that a network can violate while still passing every
+    format check (a reversed or mis-linked network routes water to a
+    headwater and DHSVM runs without complaint):
+
+    - the cell with the largest upstream area lies in an outlet segment
+      (``outlet == 0``);
+    - the lowest channel cell lies in an outlet segment;
+    - every outlet segment is flagged ``SAVE``, so its hydrograph is
+      written.
+
+    Also reported, as information: the outlet tail cells and how many of
+    them sit on the basin-mask boundary.  Several outlets are legitimate
+    when the mask really spans several drainages, and a warning when it
+    should not.
+
+    Parameters
+    ----------
+    network : dict
+        Output of :func:`extractNetwork`.
+    terrain : dict
+        Output of :func:`ww_dhsvm.terrain.conditionDEM`.
+    grid : ModelGrid
+
+    Returns
+    -------
+    dict
+        ``'ok'``, ``'errors'``, ``'warnings'``, ``'max_area_cell'``,
+        ``'max_area_segment'``, ``'lowest_cell'``, ``'lowest_segment'``,
+        ``'outlet_segments'``, ``'outlet_tails'``, ``'n_edge_outlets'``.
+    """
+    errors, warnings = [], []
+    segs = network['segments']
+    sid = np.asarray(network['segment_id_grid'])
+    mask = (grid.mask != 0) if grid.mask is not None else np.ones(grid.shape, bool)
+    uparea = np.where(mask, np.asarray(terrain['uparea'], dtype='float64'), -np.inf)
+    dem = np.asarray(terrain['dem'], dtype='float64')
+    nrows, ncols = grid.shape
+
+    outlet_ids = set(int(i) for i in segs.loc[segs['outlet'] == 0, 'ID'])
+    r, c = np.unravel_index(int(np.argmax(uparea)), uparea.shape)
+    max_seg = int(sid[r, c])
+    if max_seg == 0:
+        errors.append(f'the largest-area cell ({r},{c}) is not a channel cell')
+    elif max_seg not in outlet_ids:
+        errors.append(f'the largest-area cell ({r},{c}) lies in segment {max_seg}, '
+                      f'which drains to segment '
+                      f"{int(segs.loc[segs['ID'] == max_seg, 'outlet'].values[0])} "
+                      f'instead of being an outlet: the network does not drain to '
+                      f'the basin mouth')
+
+    on_channel = sid > 0
+    if on_channel.any():
+        z = np.where(on_channel, dem, np.inf)
+        lr, lc = np.unravel_index(int(np.argmin(z)), z.shape)
+        low_seg = int(sid[lr, lc])
+        if low_seg not in outlet_ids:
+            errors.append(f'the lowest channel cell ({lr},{lc}, {dem[lr, lc]:.2f} m) '
+                          f'lies in segment {low_seg}, which is not an outlet')
+    else:
+        lr, lc, low_seg = -1, -1, 0
+        errors.append('no channel cells')
+
+    if 'save' in segs.columns:
+        unsaved = sorted(int(i) for i in segs.loc[(segs['outlet'] == 0) & ~segs['save'].astype(bool), 'ID'])
+        if unsaved:
+            errors.append(f'outlet segments without SAVE: {unsaved[:10]}')
+
+    tails, n_edge = [], 0
+    if 'tail_cell' in segs.columns:
+        for _, s in segs[segs['outlet'] == 0].iterrows():
+            tr, tc = divmod(int(s['tail_cell']), ncols)
+            tails.append((tr, tc))
+            r0, r1 = max(tr - 1, 0), min(tr + 2, nrows)
+            c0, c1 = max(tc - 1, 0), min(tc + 2, ncols)
+            if (not mask[r0:r1, c0:c1].all()) or tr in (0, nrows - 1) or tc in (0, ncols - 1):
+                n_edge += 1
+    if len(outlet_ids) > 1:
+        warnings.append(f'{len(outlet_ids)} outlet segments, {n_edge} of them ending on '
+                        f'the mask boundary; expected for several drainages, a sign of a '
+                        f'mask past the divide for one watershed')
+
+    result = dict(ok=(len(errors) == 0), errors=errors, warnings=warnings,
+                  max_area_cell=(int(r), int(c)), max_area_segment=max_seg,
+                  lowest_cell=(int(lr), int(lc)), lowest_segment=low_seg,
+                  outlet_segments=sorted(outlet_ids), outlet_tails=tails,
+                  n_edge_outlets=n_edge)
+    if result['ok']:
+        logging.info(f'  outlets OK: largest-area cell {result["max_area_cell"]} and '
+                     f'lowest channel cell {result["lowest_cell"]} lie in outlet '
+                     f'segment(s) {result["outlet_segments"]}')
+    else:
+        for e in errors:
+            logging.error(f'  OUTLET ERROR: {e}')
+    for w in warnings:
+        logging.warning(f'  outlet warning: {w}')
+    return result
+
+
+def checkTopology(segments: pd.DataFrame,
+                  network: Optional[Dict[str, Any]] = None,
+                  terrain: Optional[Dict[str, Any]] = None,
+                  grid: Optional[ModelGrid] = None) -> Dict[str, Any]:
     """Validate the segment network against DHSVM's requirements.
 
     ``channel.c`` aborts on duplicate IDs, on an ``outlet`` that names no
@@ -820,6 +947,10 @@ def checkTopology(segments: pd.DataFrame) -> Dict[str, Any]:
     make ``channel_route_network`` recurse forever.  Catching these here,
     with an actionable message, is far cheaper than debugging a DHSVM
     abort.
+
+    When ``network``, ``terrain`` and ``grid`` are all given, the outlet
+    invariants of :func:`checkOutlets` are checked too and their errors
+    count against ``'ok'``.
 
     Returns
     -------
@@ -903,12 +1034,19 @@ def checkTopology(segments: pd.DataFrame) -> Dict[str, Any]:
             errors.append('Routing ranks are not contiguous from 1; '
                           'channel_route_network stops at the first gap')
 
+    outlets = None
+    if network is not None and terrain is not None and grid is not None:
+        outlets = checkOutlets(network, terrain, grid)
+        errors.extend(outlets['errors'])
+        warnings.extend(outlets['warnings'])
+
     strahler = (segments['strahler_order'] if 'strahler_order' in segments
                 else segments['order'])
     result = dict(ok=(len(errors) == 0), errors=errors, warnings=warnings,
                   n_segments=len(segments), n_outlets=n_outlets,
                   max_order=int(strahler.max()) if len(segments) else 0,
-                  max_routing_rank=int(segments['order'].max()) if len(segments) else 0)
+                  max_routing_rank=int(segments['order'].max()) if len(segments) else 0,
+                  outlets=outlets)
 
     if result['ok']:
         logging.info(f"  topology OK: {result['n_segments']:,} segments, "
